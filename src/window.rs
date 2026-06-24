@@ -84,6 +84,7 @@ struct AppState {
     last_update_check_unix: Option<u64>,
 
     taskbar_index: usize,
+    taskbar_device: Option<String>,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
@@ -302,6 +303,8 @@ struct SettingsFile {
     tray_offset: i32,
     #[serde(default)]
     taskbar_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taskbar_device: Option<String>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -323,6 +326,7 @@ impl Default for SettingsFile {
         Self {
             tray_offset: 0,
             taskbar_index: 0,
+            taskbar_device: None,
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
@@ -382,6 +386,7 @@ fn save_state_settings() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
+            taskbar_device: s.taskbar_device.clone(),
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
@@ -494,17 +499,28 @@ fn toggle_widget_visibility(hwnd: HWND) {
     }
 }
 
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
+fn attach_to_taskbar(
+    hwnd: HWND,
+    requested_index: usize,
+    requested_device: Option<&str>,
+) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
         diagnose::log("taskbar not found; using fallback popup window");
         return false;
     }
 
-    let index = requested_index.min(taskbars.len().saturating_sub(1));
-    let taskbar = taskbars[index];
+    // Prefer the taskbar on the same physical monitor we were last anchored to.
+    // The geometric index is unstable across monitor connect/disconnect/reorder,
+    // so matching by device name keeps the widget on the user's chosen monitor.
+    let index = requested_device
+        .filter(|d| !d.is_empty())
+        .and_then(|device| taskbars.iter().position(|t| t.device == device))
+        .unwrap_or_else(|| requested_index.min(taskbars.len().saturating_sub(1)));
+    let taskbar = taskbars[index].clone();
     diagnose::log(format!(
-        "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
+        "taskbar selected index={index} device={} count={} hwnd={:?} rect=({}, {}, {}, {})",
+        taskbar.device,
         taskbars.len(),
         taskbar.hwnd,
         taskbar.rect.left,
@@ -546,6 +562,7 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
         s.taskbar_index = index;
+        s.taskbar_device = Some(taskbar.device.clone());
         s.embedded = true;
     }
     true
@@ -1321,6 +1338,7 @@ pub fn run() {
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
+                taskbar_device: settings.taskbar_device.clone(),
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
@@ -1331,7 +1349,7 @@ pub fn run() {
         }
 
         // Try to embed in taskbar
-        if attach_to_taskbar(hwnd, settings.taskbar_index) {
+        if attach_to_taskbar(hwnd, settings.taskbar_index, settings.taskbar_device.as_deref()) {
             embedded = true;
         }
 
@@ -2487,7 +2505,7 @@ unsafe extern "system" fn wnd_proc(
                                 s.tray_offset = new_offset;
                             }
                         }
-                        if attach_to_taskbar(hwnd, target_index) {
+                        if attach_to_taskbar(hwnd, target_index, Some(&target_taskbar.device)) {
                             position_at_taskbar();
                             render_layered();
                         }
