@@ -510,14 +510,27 @@ fn attach_to_taskbar(
         return false;
     }
 
-    // Prefer the taskbar on the same physical monitor we were last anchored to.
-    // The geometric index is unstable across monitor connect/disconnect/reorder,
-    // so matching by device name keeps the widget on the user's chosen monitor.
-    let index = requested_device
+    // Selection priority:
+    //   1. The taskbar on the monitor we were last anchored to (device match).
+    //   2. The PRIMARY taskbar (Shell_TrayWnd). Critically NOT geometric index
+    //      0: find_taskbars sorts by rect.top/left, so a secondary monitor
+    //      placed above/left of the primary sorts first — falling back to
+    //      index 0 is exactly how the widget "randomly" jumped to the second
+    //      monitor. \\.\DISPLAYn device numbers can also be reassigned across
+    //      connect/disconnect, breaking the device match, so the primary
+    //      taskbar is the reliable fallback.
+    //   3. As a last resort, the saved index (legacy / no primary found).
+    let device_match = requested_device
         .filter(|d| !d.is_empty())
-        .and_then(|device| taskbars.iter().position(|t| t.device == device))
+        .and_then(|device| taskbars.iter().position(|t| t.device == device));
+    let index = device_match
+        .or_else(|| taskbars.iter().position(|t| t.primary))
         .unwrap_or_else(|| requested_index.min(taskbars.len().saturating_sub(1)));
     let taskbar = taskbars[index].clone();
+    diagnose::log(format!(
+        "attach: requested_device={requested_device:?} device_match={device_match:?} -> index={index} primary={}",
+        taskbar.primary
+    ));
     diagnose::log(format!(
         "taskbar selected index={index} device={} count={} hwnd={:?} rect=({}, {}, {}, {})",
         taskbar.device,
@@ -556,14 +569,27 @@ fn attach_to_taskbar(
         diagnose::log("tray event hook could not be installed");
     }
 
-    let mut state = lock_state();
-    if let Some(s) = state.as_mut() {
-        s.taskbar_hwnd = Some(taskbar.hwnd);
-        s.tray_notify_hwnd = tray_notify;
-        s.win_event_hook = hook;
-        s.taskbar_index = index;
-        s.taskbar_device = Some(taskbar.device.clone());
-        s.embedded = true;
+    let device_changed = {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            let changed = s.taskbar_device.as_deref() != Some(taskbar.device.as_str())
+                || s.taskbar_index != index;
+            s.taskbar_hwnd = Some(taskbar.hwnd);
+            s.tray_notify_hwnd = tray_notify;
+            s.win_event_hook = hook;
+            s.taskbar_index = index;
+            s.taskbar_device = Some(taskbar.device.clone());
+            s.embedded = true;
+            changed
+        } else {
+            false
+        }
+    };
+    // Persist the resolved monitor identity right away so a watchdog relaunch
+    // (e.g. on monitor connect/disconnect) re-anchors to the same taskbar
+    // instead of falling back to the unstable geometric index.
+    if device_changed {
+        save_state_settings();
     }
     true
 }

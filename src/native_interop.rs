@@ -31,10 +31,15 @@ pub const WM_APP_TRAY: u32 = WM_APP + 3;
 pub struct TaskbarWindow {
     pub hwnd: HWND,
     pub rect: RECT,
-    /// Stable monitor identity (e.g. "\\\\.\\DISPLAY1"). Used to keep the widget
-    /// anchored to the same physical monitor across topology changes, where the
-    /// geometric ordering (and therefore the index) of taskbars can shift.
+    /// Monitor identity (e.g. "\\\\.\\DISPLAY1"). Best-effort anchor across
+    /// topology changes. NOTE: \\.\DISPLAYn numbers can be reassigned when
+    /// monitors are connected/disconnected, so this is not a fully stable id —
+    /// `primary` is the reliable fallback.
     pub device: String,
+    /// True for the primary taskbar (`Shell_TrayWnd`). Secondary-monitor
+    /// taskbars are `Shell_SecondaryTrayWnd`. The primary taskbar always lives
+    /// on the primary monitor, so it is the safe default/fallback target.
+    pub primary: bool,
 }
 
 /// Stable identifier of the monitor a window currently lives on.
@@ -66,7 +71,13 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
             if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
                 if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
                     let device = monitor_device_name(hwnd);
-                    taskbars.push(TaskbarWindow { hwnd, rect, device });
+                    let primary = class_name == "Shell_TrayWnd";
+                    taskbars.push(TaskbarWindow {
+                        hwnd,
+                        rect,
+                        device,
+                        primary,
+                    });
                 }
             }
         }
