@@ -147,23 +147,70 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-/// Embed our window as a child of the taskbar
-pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
+pub fn setup_taskbar_overlay(hwnd: HWND) {
     unsafe {
-        // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
         let _ = SetWindowLongW(
             hwnd,
             GWL_EXSTYLE,
-            ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
+            ex_style
+                | WS_EX_TOOLWINDOW.0 as i32
+                | WS_EX_NOACTIVATE.0 as i32
+                | WS_EX_LAYERED.0 as i32,
         );
 
-        // Change from popup to child
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
+        let new_style = (style & !WS_CHILD_STYLE) | WS_POPUP_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
-        let _ = SetParent(hwnd, taskbar_hwnd);
+        let _ = SetParent(hwnd, HWND::default());
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+pub fn foreground_is_fullscreen() -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return false;
+        }
+
+        let mut class_buf = [0u16; 64];
+        let len = GetClassNameW(fg, &mut class_buf);
+        if len > 0 {
+            let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+            if matches!(
+                class_name.as_str(),
+                "WorkerW" | "Progman" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+            ) {
+                return false;
+            }
+        }
+
+        let mut window_rect = RECT::default();
+        if GetWindowRect(fg, &mut window_rect).is_err() {
+            return false;
+        }
+
+        let monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut _).as_bool() {
+            return false;
+        }
+        let m = info.monitorInfo.rcMonitor;
+        window_rect.left <= m.left
+            && window_rect.top <= m.top
+            && window_rect.right >= m.right
+            && window_rect.bottom >= m.bottom
     }
 }
 
@@ -228,7 +275,7 @@ pub fn raise_to_top(hwnd: HWND) {
     unsafe {
         let _ = SetWindowPos(
             hwnd,
-            HWND_TOP,
+            HWND_TOPMOST,
             0,
             0,
             0,

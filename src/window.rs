@@ -136,11 +136,13 @@ const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+const WM_APP_REATTACH: u32 = WM_APP + 4;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
 /// recreates the taskbar and wipes our tray-icon registration).
 const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
+const TASKBAR_MISSING_TICKS: u32 = 2;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -169,70 +171,16 @@ fn refresh_dpi() {
     }
 }
 
-/// Spacing below which two relaunches are treated as a storm (e.g. explorer.exe
-/// crash-looping); when detected we back off instead of spawning in a tight loop.
-const RELAUNCH_THROTTLE_SECS: u64 = 10;
-const RELAUNCH_BACKOFF_SECS: u64 = 30;
 const ATTACH_RETRY_MS: u32 = 1000;
-/// After this many failed 1s retries (~5s) of finding the pinned/primary
+/// After this many failed 1s retries (~30s) of finding the pinned/primary
 /// taskbar, give up insisting on it and attach to any available taskbar so the
 /// widget is never left permanently invisible.
-const ATTACH_RETRY_FALLBACK_AFTER: u32 = 5;
+const ATTACH_RETRY_FALLBACK_AFTER: u32 = 30;
 /// Count of consecutive failed attach retries; gates the fallback above.
 static ATTACH_RETRY_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 /// Environment flag set on a relaunched child so it waits for the previous
 /// instance's single-instance mutex instead of exiting immediately.
 const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
-/// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
-/// the child so it can detect a relaunch storm.
-const ENV_LAST_RELAUNCH_UNIX: &str = "CCUM_LAST_RELAUNCH_UNIX";
-
-/// Relaunch the widget as a fresh process after explorer.exe has restarted.
-///
-/// When the shell restarts it destroys our embedded child window outright (the
-/// window is gone, not merely orphaned - `IsWindow` returns false) and leaves
-/// the UI thread parked in `GetMessage` with no window to recreate in place.
-/// Spawning a clean new process - which re-embeds into the freshly created
-/// taskbar - and exiting this one is the robust recovery. The child is flagged
-/// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
-/// be released before taking over (see the guard in `run`).
-fn relaunch_self() {
-    // Back off if we are relaunching very soon after the relaunch that spawned
-    // us: that signals the shell is crash-looping, not a one-off restart.
-    let now = now_unix_secs();
-    let last = std::env::var(ENV_LAST_RELAUNCH_UNIX)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if last != 0 && now.saturating_sub(last) < RELAUNCH_THROTTLE_SECS {
-        diagnose::log("relaunch storm detected; backing off before relaunching");
-        std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to resolve current executable", error);
-            return;
-        }
-    };
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(exe)
-        .args(&args)
-        .env(ENV_RELAUNCH, "1")
-        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
-        .spawn()
-    {
-        Ok(_) => {
-            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
-            std::process::exit(0);
-        }
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
-        }
-    }
-}
 
 /// Detect explorer.exe restarts and recover from them.
 ///
@@ -241,24 +189,39 @@ fn relaunch_self() {
 /// dedicated thread (independent of the dead message loop) polls the taskbar
 /// handle and, when it changes, relaunches the widget as a fresh process.
 fn spawn_taskbar_watchdog() {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let stored = {
-            let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
-        };
-        // Only relevant once we have embedded into a taskbar at least once.
-        let Some(old) = stored else {
-            continue;
-        };
-        let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
-            let new = taskbars[0].hwnd;
+    std::thread::spawn(move || {
+        let mut missing_streak = 0u32;
+        loop {
+            std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
+            let (stored, our_hwnd) = {
+                let state = lock_state();
+                match state.as_ref() {
+                    Some(s) => (s.taskbar_hwnd, s.hwnd),
+                    None => (None, SendHwnd(0)),
+                }
+            };
+            let Some(old) = stored else {
+                missing_streak = 0;
+                continue;
+            };
+            let taskbars = native_interop::find_taskbars();
+            let present = taskbars.iter().any(|taskbar| taskbar.hwnd == old);
+            if taskbars.is_empty() || present {
+                missing_streak = 0;
+                continue;
+            }
+            missing_streak += 1;
+            if missing_streak < TASKBAR_MISSING_TICKS {
+                continue;
+            }
+            missing_streak = 0;
             diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                old.0, new.0
+                "watchdog: taskbar {:?} gone -> re-attaching in place",
+                old.0
             ));
-            relaunch_self();
+            unsafe {
+                let _ = PostMessageW(our_hwnd.to_hwnd(), WM_APP_REATTACH, WPARAM(0), LPARAM(0));
+            }
         }
     });
 }
@@ -584,7 +547,7 @@ fn attach_to_taskbar(
         native_interop::unhook_win_event(hook);
     }
 
-    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
+    native_interop::setup_taskbar_overlay(hwnd);
 
     let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
     if tray_notify.is_some() {
@@ -1444,18 +1407,8 @@ pub fn run() {
             embedded = true;
         }
 
-        // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
         if !embedded {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+            native_interop::setup_taskbar_overlay(hwnd);
             SetTimer(hwnd, TIMER_ATTACH_RETRY, ATTACH_RETRY_MS, None);
         }
 
@@ -1581,14 +1534,7 @@ fn render_layered() {
     };
 
     let hwnd = hwnd_val.to_hwnd();
-
-    // For non-embedded fallback, just invalidate and let WM_PAINT handle it
-    if !embedded {
-        unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
-        }
-        return;
-    }
+    let _ = embedded;
 
     let width = total_widget_width();
     let height = sc(WIDGET_HEIGHT);
@@ -2245,23 +2191,13 @@ fn position_at_taskbar() {
 
     let widget_height = sc(WIDGET_HEIGHT);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-    if embedded {
-        // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
-        native_interop::raise_to_top(hwnd);
-        diagnose::log(format!(
-            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
-            y - taskbar_rect.top
-        ));
-    } else {
-        // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
-        ));
-    }
+    let _ = embedded;
+    let x = tray_left - widget_width - tray_offset;
+    native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+    native_interop::raise_to_top(hwnd);
+    diagnose::log(format!(
+        "positioned overlay widget at x={x} y={y} w={widget_width} h={widget_height}"
+    ));
 }
 
 fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
@@ -2315,61 +2251,42 @@ unsafe extern "system" fn on_tray_location_changed(
     }
 }
 
-/// Periodic z-order guard. While embedded, keep the widget on top of its
-/// taskbar siblings so the shell can't leave it buried behind the taskbar
-/// backdrop. `raise_to_top` does not repaint, so the steady-state cost is a
-/// single SetWindowPos per tick. Diagnostic logging fires only when the
-/// window's visibility or rectangle actually changes.
-fn z_guard_tick(_hwnd: HWND) {
-    static LAST: Mutex<Option<(bool, i32, i32, i32, i32)>> = Mutex::new(None);
-
-    let (hwnd, embedded) = {
+fn sync_overlay_visibility() {
+    let (hwnd, want_visible) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) if s.embedded => (s.hwnd.to_hwnd(), true),
+            Some(s) if s.embedded => (s.hwnd.to_hwnd(), s.widget_visible),
             _ => return,
         }
+    };
+
+    let show = want_visible && !native_interop::foreground_is_fullscreen();
+    unsafe {
+        let visible = IsWindowVisible(hwnd).as_bool();
+        if show {
+            if !visible {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                position_at_taskbar();
+                render_layered();
+            }
+            native_interop::raise_to_top(hwnd);
+        } else if visible {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+fn z_guard_tick(_hwnd: HWND) {
+    let embedded = {
+        let state = lock_state();
+        state.as_ref().map(|s| s.embedded).unwrap_or(false)
     };
     if !embedded {
         return;
     }
-
-    native_interop::raise_to_top(hwnd);
-
-    let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
-    if !visible {
-        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
-    }
-
-    // DIAGNOSTIC: re-push our layered content every tick. If this stops the
-    // vanish, the cause is the shell compositing its taskbar backdrop over our
-    // child (DirectComposition), not HWND z-order.
-    render_layered();
-
-    let rect = native_interop::get_window_rect_safe(hwnd)
-        .map(|r| (r.left, r.top, r.right, r.bottom))
-        .unwrap_or((0, 0, 0, 0));
-    let snapshot = (visible, rect.0, rect.1, rect.2, rect.3);
-    let changed = {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if last.as_ref() != Some(&snapshot) {
-            *last = Some(snapshot);
-            true
-        } else {
-            false
-        }
-    };
-    let _ = changed;
-    diagnose::log(format!(
-        "zguard tick: visible={visible} rect=({}, {}, {}, {})",
-        rect.0, rect.1, rect.2, rect.3
-    ));
+    sync_overlay_visibility();
 }
 
-/// WinEvent callback for system foreground changes. When the Start menu or a
-/// taskbar flyout opens/closes the shell reorders its taskbar children and our
-/// embedded widget gets buried behind the taskbar backdrop (it "disappears").
-/// Re-raising it to the top of the sibling z-order and re-rendering restores it.
 unsafe extern "system" fn on_foreground_changed(
     _hook: HWINEVENTHOOK,
     _event: u32,
@@ -2381,18 +2298,14 @@ unsafe extern "system" fn on_foreground_changed(
 ) {
     static LAST_RAISE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-    let (hwnd, embedded) = {
+    let embedded = {
         let state = lock_state();
-        match state.as_ref() {
-            Some(s) if s.embedded => (s.hwnd.to_hwnd(), true),
-            _ => return,
-        }
+        state.as_ref().map(|s| s.embedded).unwrap_or(false)
     };
     if !embedded {
         return;
     }
 
-    // Foreground changes fire frequently; debounce so we don't thrash.
     let should_raise = {
         let mut last = LAST_RAISE.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
@@ -2407,14 +2320,7 @@ unsafe extern "system" fn on_foreground_changed(
         }
     };
     if should_raise {
-        let visible_before = unsafe { IsWindowVisible(hwnd).as_bool() };
-        native_interop::raise_to_top(hwnd);
-        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
-        position_at_taskbar();
-        render_layered();
-        diagnose::log(format!(
-            "foreground change: raised+repositioned widget (visible_before={visible_before})"
-        ));
+        sync_overlay_visibility();
     }
 }
 
@@ -2569,6 +2475,26 @@ unsafe extern "system" fn wnd_proc(
             schedule_auto_update_check(hwnd);
             LRESULT(0)
         }
+        WM_APP_REATTACH => {
+            let (idx, dev) = {
+                let state = lock_state();
+                state
+                    .as_ref()
+                    .map(|s| (s.taskbar_index, s.taskbar_device.clone()))
+                    .unwrap_or((0, None))
+            };
+            ATTACH_RETRY_ATTEMPTS.store(0, Ordering::Relaxed);
+            if attach_to_taskbar(hwnd, idx, dev.as_deref(), false) {
+                sync_tray_icons(hwnd);
+                position_at_taskbar();
+                render_layered();
+                diagnose::log("re-attach succeeded in place");
+            } else {
+                SetTimer(hwnd, TIMER_ATTACH_RETRY, ATTACH_RETRY_MS, None);
+                diagnose::log("re-attach deferred to retry timer");
+            }
+            LRESULT(0)
+        }
         WM_SETCURSOR => {
             let is_dragging = {
                 let state = lock_state();
@@ -2659,17 +2585,12 @@ unsafe extern "system" fn wnd_proc(
                             let anchor_height = taskbar_height;
                             let widget_height = sc(WIDGET_HEIGHT);
                             let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-                            let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - new_offset
-                            } else {
-                                tray_left - widget_width - new_offset
-                            };
+                            let _ = embedded;
+                            let x = tray_left - widget_width - new_offset;
                             Some((
                                 hwnd_val,
-                                embedded,
                                 x,
                                 y,
-                                taskbar_rect.top,
                                 widget_width,
                                 widget_height,
                             ))
@@ -2683,20 +2604,8 @@ unsafe extern "system" fn wnd_proc(
                     }
                 };
 
-                if let Some((hwnd_val, embedded, x, y, taskbar_top, widget_width, widget_height)) =
-                    move_target
-                {
-                    if embedded {
-                        native_interop::move_window(
-                            hwnd_val,
-                            x,
-                            y - taskbar_top,
-                            widget_width,
-                            widget_height,
-                        );
-                    } else {
-                        native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
-                    }
+                if let Some((hwnd_val, x, y, widget_width, widget_height)) = move_target {
+                    native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
                 }
             }
             LRESULT(0)
