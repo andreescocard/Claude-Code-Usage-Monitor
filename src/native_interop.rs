@@ -290,6 +290,10 @@ pub fn get_window_thread_id(hwnd: HWND) -> u32 {
     unsafe { GetWindowThreadProcessId(hwnd, None) }
 }
 
+pub fn window_exists(hwnd: HWND) -> bool {
+    unsafe { IsWindow(hwnd).as_bool() }
+}
+
 /// Unhook a WinEvent hook
 pub fn unhook_win_event(hook: HWINEVENTHOOK) {
     unsafe {

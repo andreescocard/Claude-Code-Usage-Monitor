@@ -182,12 +182,10 @@ static ATTACH_RETRY_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 /// instance's single-instance mutex instead of exiting immediately.
 const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
 
-/// Detect explorer.exe restarts and recover from them.
-///
-/// Once explorer destroys the taskbar, our embedded child window is destroyed
-/// and the UI message loop is dead, so recovery cannot happen in-process. This
-/// dedicated thread (independent of the dead message loop) polls the taskbar
-/// handle and, when it changes, relaunches the widget as a fresh process.
+/// Detect explorer.exe restarts and recover from them. Polls the stored
+/// taskbar handle; only when it is truly destroyed (not merely un-enumerable
+/// while the Start menu is open) does it post WM_APP_REATTACH to re-attach in
+/// place on the UI thread.
 fn spawn_taskbar_watchdog() {
     std::thread::spawn(move || {
         let mut missing_streak = 0u32;
@@ -204,6 +202,10 @@ fn spawn_taskbar_watchdog() {
                 missing_streak = 0;
                 continue;
             };
+            if native_interop::window_exists(old) {
+                missing_streak = 0;
+                continue;
+            }
             let taskbars = native_interop::find_taskbars();
             let present = taskbars.iter().any(|taskbar| taskbar.hwnd == old);
             if taskbars.is_empty() || present {
