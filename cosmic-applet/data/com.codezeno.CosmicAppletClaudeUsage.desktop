@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Claude Usage
+Comment=Shows Claude Code and Codex usage in the panel
+Type=Application
+Exec=cosmic-applet-claude-usage
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Claude;Codex;Usage;
+Icon=utilities-system-monitor-symbolic
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
+X-OverflowPriority=10

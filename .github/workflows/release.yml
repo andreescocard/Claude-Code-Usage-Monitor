@@ -23,7 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --package claude-code-usage-monitor
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
