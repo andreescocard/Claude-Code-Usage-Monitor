@@ -82,6 +82,7 @@ pub enum Message {
 
 struct DragState {
     grab: Point,
+    last: Point,
     moved: bool,
 }
 
@@ -195,20 +196,35 @@ impl Application for ClaudeUsageApplet {
             Message::DragStart => {
                 self.drag = Some(DragState {
                     grab: self.hover_pos,
+                    last: self.hover_pos,
                     moved: false,
                 });
             }
             Message::DragMove(pos) => {
                 if let Some(drag) = self.drag.as_mut() {
-                    // Servo-follow: move the surface so the grab point stays under
-                    // the cursor. Correction is the offset of the cursor from where
-                    // it was grabbed; margin is nudged by that each motion event.
-                    let dx = pos.x - drag.grab.x;
-                    let dy = pos.y - drag.grab.y;
-                    if dx.abs() > DRAG_THRESHOLD || dy.abs() > DRAG_THRESHOLD {
+                    // Click-vs-drag distinction uses the total offset from the
+                    // original grab point.
+                    let total_dx = pos.x - drag.grab.x;
+                    let total_dy = pos.y - drag.grab.y;
+                    if total_dx.abs() > DRAG_THRESHOLD || total_dy.abs() > DRAG_THRESHOLD {
                         drag.moved = true;
                     }
                     if drag.moved {
+                        // Move the surface by the delta since the *last processed*
+                        // event, not since the original grab. `pos` is local to the
+                        // surface, and the surface itself is what we're relocating
+                        // via set_margin, so its coordinate frame only stays valid
+                        // once the compositor has applied our previous margin
+                        // request. That request is async (a Task), so pointer-motion
+                        // events routinely arrive before it lands. Diffing against a
+                        // fixed, distant grab point re-adds that not-yet-applied lag
+                        // on every event, so the offset compounds and the widget
+                        // runs away from the cursor. Diffing against the previous
+                        // event instead means any one frame of lag only produces a
+                        // one-frame error, which self-corrects on the next move.
+                        let dx = pos.x - drag.last.x;
+                        let dy = pos.y - drag.last.y;
+                        drag.last = pos;
                         self.config.x = (self.config.x + dx.round() as i32).max(0);
                         self.config.y = (self.config.y + dy.round() as i32).max(0);
                         return set_margin(self.layer_id, self.config.y, 0, 0, self.config.x);
